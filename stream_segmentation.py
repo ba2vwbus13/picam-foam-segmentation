@@ -25,7 +25,24 @@ import numpy as np
 import requests
 import torch
 
-DEFAULT_URL = os.environ.get("PICAM_URL")  # 例: https://<camera-host>/stream
+ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def load_env_file(path):
+    """KEY=VALUE 形式のファイルを環境変数に読み込む (既に設定済みの環境変数が優先)"""
+    if not os.path.exists(path):
+        return False
+    for line in open(path, encoding="utf-8"):
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip().removeprefix("export ").strip()
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        os.environ.setdefault(k, v)
+    return True
 DEVICE = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -191,8 +208,15 @@ def process(frame, sem, ins, foam=None):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default=DEFAULT_URL, help="ストリーム URL (未指定時は環境変数 PICAM_URL)")
+    # 接続情報 (PICAM_URL / PICAM_USER / PICAM_PASS) は .env から読む
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--env-file", default=ENV_FILE)
+    env_file = pre.parse_known_args()[0].env_file
+    load_env_file(env_file)
+
+    ap = argparse.ArgumentParser(parents=[pre])
+    ap.add_argument("--url", default=os.environ.get("PICAM_URL"),
+                    help="ストリーム URL (未指定時は .env / 環境変数の PICAM_URL)")
     ap.add_argument("--mode", default="semantic",
                     help="semantic / instance / foam をカンマ区切りで組み合わせ可 (例: foam,instance)。both = semantic,instance")
     ap.add_argument("--seg-model", default="nvidia/segformer-b2-finetuned-ade-512-512",
@@ -204,6 +228,7 @@ def main():
     ap.add_argument("--save", help="結果を mp4 (ストリーム) / 画像 (--image) で保存")
     ap.add_argument("--snapshot-dir", default="snapshots", help="'s' キーで保存する先")
     ap.add_argument("--no-window", action="store_true")
+    ap.add_argument("--foam-model", help="学習済み泡モデルのフォルダ (例: models/foam_segformer)。指定時は閾値処理の代わりに使用")
     ap.add_argument("--roi", default="foam_roi.json", help="foam モードの水面 ROI 保存先")
     ap.add_argument("--calibrate", action="store_true", help="foam モードの水面 ROI をクリックで手動設定")
     ap.add_argument("--reset-roi", action="store_true", help="保存済み ROI を破棄して自動推定し直す")
@@ -225,7 +250,11 @@ def main():
         from foam import FoamSegmenter
         if args.reset_roi and os.path.exists(args.roi):
             os.remove(args.roi)
-        foam = FoamSegmenter(args.roi)
+        if args.foam_model:
+            from foam import FoamModelSegmenter
+            foam = FoamModelSegmenter(args.foam_model)
+        else:
+            foam = FoamSegmenter(args.roi)
 
     if args.image:
         frame = cv2.imread(args.image)
@@ -241,12 +270,12 @@ def main():
 
     user, pw = os.environ.get("PICAM_USER"), os.environ.get("PICAM_PASS")
     if not user or not pw:
-        raise SystemExit("環境変数 PICAM_USER / PICAM_PASS を設定してください")
+        raise SystemExit(f"PICAM_USER / PICAM_PASS が未設定です。{env_file} に記入するか環境変数で指定してください")
     # kill (SIGTERM) でも動画を正しく閉じて終了する
     import signal
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
     if not args.url:
-        raise SystemExit("--url または環境変数 PICAM_URL でストリーム URL を指定してください")
+        raise SystemExit(f"ストリーム URL が未設定です。{env_file} の PICAM_URL か --url で指定してください")
     reader = MJPEGReader(args.url, (user, pw))
     reader.start()
 

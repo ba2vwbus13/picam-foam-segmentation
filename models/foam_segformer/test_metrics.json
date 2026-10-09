@@ -1,0 +1,7 @@
+{
+ "iou_background": 0.9951,
+ "iou_surface": 0.8653,
+ "iou_foam": 0.813,
+ "miou": 0.8911,
+ "foam_ratio_mae": 0.0129
+}

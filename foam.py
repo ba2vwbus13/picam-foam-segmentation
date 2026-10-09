@@ -107,7 +107,10 @@ class FoamSegmenter:
     def __call__(self, bgr):
         if self.ellipse is None:
             self.estimate_roi(bgr)
-        roi = self.roi_mask(bgr.shape)
+        return self.segment(bgr, self.roi_mask(bgr.shape))
+
+    def segment(self, bgr, roi):
+        """任意の水面 ROI マスクに対して泡を抽出する (データセット作成でも使用)"""
         L = cv2.GaussianBlur(cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[..., 0], (5, 5), 0)
         S = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 1]
         t, _ = cv2.threshold(L[roi > 0], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -158,3 +161,42 @@ class FoamSegmenter:
         (cx, cy), (a, b), ang = self.ellipse
         sx, sy = shape[1] / self.size[0], shape[0] / self.size[1]
         return (cx * sx, cy * sy), (a * sx, b * sy), ang
+
+
+class FoamModelSegmenter(FoamSegmenter):
+    """学習済み SegFormer (train_foam.py) で 水面/泡 を直接推定する版。閾値処理と ROI 設定は不要"""
+
+    def __init__(self, model_dir="models/foam_segformer", trail=60):
+        import torch
+        from train_foam import DEVICE, INFER_SIZE, load_model, to_tensor
+        self.torch, self.device, self.size_in, self.to_tensor = torch, DEVICE, INFER_SIZE, to_tensor
+        self.model = load_model(model_dir).eval()
+        self.trail = deque(maxlen=trail)
+        self.ellipse = None  # 水面の楕円 (推定結果から毎フレーム更新、重心のずれ計算用)
+
+    def __call__(self, bgr):
+        torch = self.torch
+        h, w = bgr.shape[:2]
+        x = self.to_tensor(cv2.resize(bgr, self.size_in, interpolation=cv2.INTER_AREA))[None].to(self.device)
+        with torch.no_grad():
+            logits = self.model(pixel_values=x).logits
+            pred = torch.nn.functional.interpolate(logits, size=(h, w), mode="bilinear",
+                                                   align_corners=False).argmax(1)[0].cpu().numpy()
+        roi = (pred >= 1).astype(np.uint8) * 255
+        # 水面は最大の連結成分だけ残す (他の水槽の誤検出を除く)
+        n, lab, st, _ = cv2.connectedComponentsWithStats(roi)
+        if n > 1:
+            roi = (lab == 1 + np.argmax(st[1:, cv2.CC_STAT_AREA])).astype(np.uint8) * 255
+        foam = ((pred == 2) & (roi > 0)).astype(np.uint8) * 255
+        cs, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if cs and len(max(cs, key=cv2.contourArea)) >= 5:
+            self.ellipse = cv2.fitEllipse(max(cs, key=cv2.contourArea))
+        ratio = float((foam > 0).sum()) / max(int((roi > 0).sum()), 1)
+        m = cv2.moments(foam, binaryImage=True)
+        centroid = (m["m10"] / m["m00"], m["m01"] / m["m00"]) if m["m00"] > 0 else None
+        if centroid:
+            self.trail.append(centroid)
+        return foam, roi, ratio, float("nan"), centroid
+
+    def ellipse_px(self, shape):
+        return self.ellipse

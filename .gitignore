@@ -4,3 +4,9 @@ __pycache__/
 *.pt
 *.mp4
 .DS_Store
+.env
+# 大容量 / 人物が写る画像 (公開リポジトリには含めない。引き継ぎ書参照)
+dataset/
+feeding/
+samples/turbid/
+*.log
