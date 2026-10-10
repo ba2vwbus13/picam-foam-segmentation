@@ -3,8 +3,9 @@
 
   .venv/bin/python train_foam.py                 # 学習 -> models/foam_segformer/
   .venv/bin/python train_foam.py --eval-only     # test セットで評価のみ
+  .venv/bin/python train_foam.py --data dataset_fish --classes background,water,foam,fish --out models/fish_segformer
 
-クラス: 0=水面外, 1=水面 (泡以外), 2=泡
+クラス: 0=水面外, 1=水面 (泡以外), 2=泡 (, 3=魚群)。2 以降を「対象クラス」として割合・IoU を評価する
 """
 import argparse
 import csv
@@ -71,9 +72,17 @@ class FoamDataset(torch.utils.data.Dataset):
 
 
 def load_model(path_or_name, new_head=False):
-    kw = dict(num_labels=3, id2label=dict(enumerate(CLASSES)), label2id={c: i for i, c in enumerate(CLASSES)},
+    kw = dict(num_labels=len(CLASSES), id2label=dict(enumerate(CLASSES)), label2id={c: i for i, c in enumerate(CLASSES)},
               ignore_mismatched_sizes=True) if new_head else {}
-    return SegformerForSemanticSegmentation.from_pretrained(path_or_name, **kw).to(DEVICE)
+    model = SegformerForSemanticSegmentation.from_pretrained(path_or_name, **kw).to(DEVICE)
+    if DEVICE == "mps":
+        # macOS 14.1 + MPS では channels-last (非連続) テンソルを受ける層の逆伝播が誤った勾配を返し、学習が
+        # 「全画素=水面外」に潰れる (順伝播は正しいので推論には影響しない)。各層の入力を連続化して回避する
+        def contiguous(_m, inp):
+            return tuple(t.contiguous() if torch.is_tensor(t) else t for t in inp)
+        for mod in model.modules():
+            mod.register_forward_pre_hook(contiguous)
+    return model
 
 
 @torch.no_grad()
@@ -85,22 +94,23 @@ def predict(model, x, size):
 @torch.no_grad()
 def evaluate(model, ds):
     model.eval()
-    inter, union = np.zeros(3), np.zeros(3)
-    ratio_err = []
+    n = len(CLASSES)
+    inter, union = np.zeros(n), np.zeros(n)
+    ratio_err = {c: [] for c in range(2, n)}
     for i in range(len(ds)):
         x, y = ds[i]
         p = predict(model, x[None].to(DEVICE), y.shape)[0].cpu()
-        for c in range(3):
+        for c in range(n):
             inter[c] += ((p == c) & (y == c)).sum().item()
             union[c] += ((p == c) | (y == c)).sum().item()
-        # 泡の割合 = 泡 / (水面 + 泡)
-        def ratio(m):
-            s = ((m == 1) | (m == 2)).sum().item()
-            return (m == 2).sum().item() / max(s, 1)
-        ratio_err.append(abs(ratio(p) - ratio(y)))
+        # 対象クラスの割合 = そのクラス / 水面全体 (クラス 1 以上)
+        for c in ratio_err:
+            ratio = [(m == c).sum().item() / max((m >= 1).sum().item(), 1) for m in (p, y)]
+            ratio_err[c].append(abs(ratio[0] - ratio[1]))
     iou = inter / np.maximum(union, 1)
     return {"iou_" + c: round(float(v), 4) for c, v in zip(CLASSES, iou)} | {
-        "miou": round(float(iou.mean()), 4), "foam_ratio_mae": round(float(np.mean(ratio_err)), 4)}
+        "miou": round(float(iou.mean()), 4), "target_iou": round(float(iou[2:].mean()), 4)} | {
+        f"{CLASSES[c]}_ratio_mae": round(float(np.mean(e)), 4) for c, e in ratio_err.items()}
 
 
 def main():
@@ -111,8 +121,11 @@ def main():
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=6e-5)
+    ap.add_argument("--classes", default=",".join(CLASSES))
+    ap.add_argument("--fish-weight", type=float, default=1.0, help="最後のクラスの損失の重み (魚群は画素が少ない)")
     ap.add_argument("--eval-only", action="store_true")
     args = ap.parse_args()
+    CLASSES[:] = args.classes.split(",")
     torch.manual_seed(0), random.seed(0), np.random.seed(0)
 
     val, test = FoamDataset(args.data, "val", False), FoamDataset(args.data, "test", False)
@@ -126,6 +139,8 @@ def main():
     dl = torch.utils.data.DataLoader(train, batch_size=args.batch, shuffle=True, num_workers=4,
                                      persistent_workers=True, drop_last=True)
     model = load_model(args.base, new_head=True)
+    weight = torch.ones(len(CLASSES), device=DEVICE)
+    weight[-1] = args.fish_weight
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr * 10, total_steps=args.epochs * len(dl),
                                                 pct_start=0.1)
@@ -137,7 +152,7 @@ def main():
             x, y = x.to(DEVICE), y.to(DEVICE)
             logits = F.interpolate(model(pixel_values=x).logits, size=y.shape[-2:], mode="bilinear",
                                    align_corners=False)
-            loss = F.cross_entropy(logits, y)
+            loss = F.cross_entropy(logits, y, weight=weight if args.fish_weight != 1 else None)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -146,14 +161,14 @@ def main():
         m = evaluate(model, val)
         hist.append({"epoch": ep, "loss": round(tot / len(dl), 4), **m})
         print(f"ep{ep:3d} loss {tot/len(dl):.4f} val {m} ({time.time()-t0:.0f}s)", flush=True)
-        if m["iou_foam"] > best:
-            best = m["iou_foam"]
+        if m["target_iou"] > best:
+            best = m["target_iou"]
             model.save_pretrained(args.out)
     json.dump(hist, open(os.path.join(args.out, "history.json"), "w"), indent=1)
     model = load_model(args.out)
     res = evaluate(model, test)
     json.dump(res, open(os.path.join(args.out, "test_metrics.json"), "w"), indent=1)
-    print("best val foam IoU", best, "| test:", res)
+    print("best val target IoU", best, "| test:", res)
 
 
 if __name__ == "__main__":

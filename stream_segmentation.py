@@ -11,6 +11,7 @@ PiCam MJPEG ストリームに対するリアルタイム・セグメンテー�
   .venv/bin/python stream_segmentation.py
   .venv/bin/python stream_segmentation.py --mode both --save out.mp4
   .venv/bin/python stream_segmentation.py --mode foam --csv foam_log.csv
+  .venv/bin/python stream_segmentation.py --mode fish --fish-model models/fish_segformer --fish-csv fish_log.csv
 
 ローカル画像で試す場合:
   .venv/bin/python stream_segmentation.py --image sample.jpg
@@ -183,6 +184,16 @@ class InstanceSegmenter:
 
 
 # ---------------------------------------------------------------- util
+def open_video_writer(path, fps, size):
+    """H.264 (avc1) で書く。mp4v (MPEG-4 Part 2) はブラウザや一部のプレーヤーで緑一色などになり再生できないため。
+    H.264 が使えない環境では mp4v にフォールバック"""
+    for cc in ("avc1", "mp4v"):
+        w = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*cc), fps, size)
+        if w.isOpened():
+            return w
+    raise RuntimeError(f"動画を書き出せません: {path}")
+
+
 def put_text(img, text, org, scale=0.5):
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), 1, cv2.LINE_AA)
@@ -195,13 +206,15 @@ def put_label(img, text, center, color):
     cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA)
 
 
-def process(frame, sem, ins, foam=None):
-    # 描画順: semantic (背景の塗り分け) -> foam -> instance (YOLO) 。推論は常に元フレームに対して行う
+def process(frame, sem, ins, foam=None, fish=None):
+    # 描画順: semantic (背景の塗り分け) -> foam -> fish -> instance (YOLO) 。推論は常に元フレームに対して行う
     out, info = frame, {}
     if sem:
         out, info["semantic"] = sem.draw(out, sem(frame))
     if foam:
         out, info["foam"] = foam.draw(out, foam(frame))
+    if fish:
+        out, info["fish"] = fish.draw(out, fish(frame))
     if ins:
         out, info["instance"] = ins.draw(out, ins(frame))
     return out, info
@@ -218,7 +231,7 @@ def main():
     ap.add_argument("--url", default=os.environ.get("PICAM_URL"),
                     help="ストリーム URL (未指定時は .env / 環境変数の PICAM_URL)")
     ap.add_argument("--mode", default="semantic",
-                    help="semantic / instance / foam をカンマ区切りで組み合わせ可 (例: foam,instance)。both = semantic,instance")
+                    help="semantic / instance / foam / fish をカンマ区切りで組み合わせ可 (例: foam,instance)。both = semantic,instance")
     ap.add_argument("--seg-model", default="nvidia/segformer-b2-finetuned-ade-512-512",
                     help="例: nvidia/segformer-b0-finetuned-ade-512-512 (軽量) / -b4- (高精度)")
     ap.add_argument("--yolo", default="yolo11m-seg.pt")
@@ -233,6 +246,8 @@ def main():
     ap.add_argument("--calibrate", action="store_true", help="foam モードの水面 ROI をクリックで手動設定")
     ap.add_argument("--reset-roi", action="store_true", help="保存済み ROI を破棄して自動推定し直す")
     ap.add_argument("--csv", help="foam モードで泡の割合を時系列 CSV に追記")
+    ap.add_argument("--fish-model", help="学習済み 4 クラスモデル (例: models/fish_segformer)。未指定時は閾値処理")
+    ap.add_argument("--fish-csv", help="fish モードで魚群の割合・給餌の狙い点を時系列 CSV に追記")
     ap.add_argument("--save-fps", type=float, default=15.0,
                     help="保存動画の fps。実時間に合わせて間引き/複製するので再生速度は実時間と一致")
     ap.add_argument("--csv-interval", type=float, default=1.0, help="CSV 記録間隔 [秒]")
@@ -240,9 +255,10 @@ def main():
 
     print(f"device: {DEVICE}")
     modes = set(args.mode.replace("both", "semantic,instance").split(","))
-    if not modes <= {"semantic", "instance", "foam"}:
-        ap.error(f"未知のモード: {modes - {'semantic', 'instance', 'foam'}}")
-    args.mode = "+".join(m for m in ("semantic", "foam", "instance") if m in modes)  # 表示・ファイル名用
+    known = {"semantic", "instance", "foam", "fish"}
+    if not modes <= known:
+        ap.error(f"未知のモード: {modes - known}")
+    args.mode = "+".join(m for m in ("semantic", "foam", "fish", "instance") if m in modes)  # 表示・ファイル名用
     sem = SemanticSegmenter(args.seg_model) if "semantic" in modes else None
     ins = InstanceSegmenter(args.yolo, args.conf, args.yolo_classes.split(",") if args.yolo_classes else None) if "instance" in modes else None
     foam = None
@@ -255,12 +271,16 @@ def main():
             foam = FoamModelSegmenter(args.foam_model)
         else:
             foam = FoamSegmenter(args.roi)
+    fish = None
+    if "fish" in modes:
+        from fish import LiveFish
+        fish = LiveFish(args.fish_model)
 
     if args.image:
         frame = cv2.imread(args.image)
         if foam and args.calibrate:
             foam.calibrate(frame)
-        out, info = process(frame, sem, ins, foam)
+        out, info = process(frame, sem, ins, foam, fish)
         for k, v in info.items():
             print(k, v)
         dst = args.save or os.path.splitext(args.image)[0] + f"_{args.mode}.jpg"
@@ -280,6 +300,7 @@ def main():
     reader.start()
 
     writer, last_seq, t0, n, last_log, next_write = None, 0, time.time(), 0, 0.0, 0.0
+    last_fish_log = 0.0
     os.makedirs(args.snapshot_dir, exist_ok=True)
     try:
         while reader.running or reader.frame is not None:
@@ -293,7 +314,16 @@ def main():
             if foam and args.calibrate:
                 foam.calibrate(frame)
                 args.calibrate = False
-            out, info = process(frame, sem, ins, foam)
+            out, info = process(frame, sem, ins, foam, fish)
+            if args.fish_csv and "fish" in info and time.time() - last_fish_log >= args.csv_interval:
+                new = not os.path.exists(args.fish_csv)
+                fi = info["fish"]
+                with open(args.fish_csv, "a") as f:
+                    if new:
+                        f.write("timestamp,fish_ratio,aim_x,aim_y,aim_dx,aim_dy\n")
+                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{fi['fish_ratio']},"
+                            f"{fi['aim_x']},{fi['aim_y']},{fi['aim_dx']},{fi['aim_dy']}\n")
+                last_fish_log = time.time()
             if args.csv and "foam" in info and time.time() - last_log >= args.csv_interval:
                 header = "timestamp,foam_ratio,cx,cy,dx,dy\n"
                 if os.path.exists(args.csv) and open(args.csv).readline() != header:
@@ -314,7 +344,7 @@ def main():
             if args.save:
                 now = time.time()
                 if writer is None:
-                    writer = cv2.VideoWriter(args.save, cv2.VideoWriter_fourcc(*"mp4v"), args.save_fps,
+                    writer = open_video_writer(args.save, args.save_fps,
                                              (out.shape[1], out.shape[0]))
                     next_write = now
                 rec = out.copy()

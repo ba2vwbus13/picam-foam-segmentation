@@ -1,0 +1,10 @@
+{
+ "iou_background": 0.9974,
+ "iou_water": 0.8447,
+ "iou_foam": 0.8074,
+ "iou_fish": 0.7796,
+ "miou": 0.8573,
+ "target_iou": 0.7935,
+ "foam_ratio_mae": 0.0181,
+ "fish_ratio_mae": 0.0073
+}

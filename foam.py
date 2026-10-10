@@ -16,10 +16,11 @@ import numpy as np
 
 
 class FoamSegmenter:
-    def __init__(self, roi_path="foam_roi.json", shrink=0.97, sat_max=60, sem=None, trail=60):
+    def __init__(self, roi_path="foam_roi.json", shrink=0.97, sat_max=60, sem=None, trail=60, l_min=0):
         self.roi_path = roi_path
         self.shrink = shrink
         self.sat_max = sat_max
+        self.l_min = l_min  # 泡とみなす明るさの下限 (Otsu が濁った水を二分して泡を過大評価するのを防ぐ)
         self.sem = sem  # 自動 ROI 推定に使う SemanticSegmenter (遅延生成)
         self.ellipse = None
         self.size = None
@@ -114,7 +115,7 @@ class FoamSegmenter:
         L = cv2.GaussianBlur(cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)[..., 0], (5, 5), 0)
         S = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[..., 1]
         t, _ = cv2.threshold(L[roi > 0], 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        foam = ((L > t) & (S < self.sat_max) & (roi > 0)).astype(np.uint8) * 255
+        foam = ((L > max(t, self.l_min)) & (S < self.sat_max) & (roi > 0)).astype(np.uint8) * 255
         foam = cv2.morphologyEx(foam, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
         foam = cv2.morphologyEx(foam, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
         ratio = float((foam > 0).sum()) / max(int((roi > 0).sum()), 1)

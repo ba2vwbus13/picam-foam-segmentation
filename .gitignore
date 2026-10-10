@@ -10,3 +10,9 @@ dataset/
 feeding/
 samples/turbid/
 *.log
+*.zip
+archive/
+dataset_fish/
+labels/
+fish_out/
+models/fish_segformer_v1/
