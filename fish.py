@@ -229,15 +229,21 @@ class LiveFish:
     info の aim_dx, aim_dy は水面の楕円中心からのずれを半径で正規化した値 (-1〜1、右・下が正、画像座標)
     """
 
-    def __init__(self, model_dir=None, n=5, hold=1.0):
+    def __init__(self, model_dir=None, n=5, hold=1.0, trigger=None):
+        """trigger: trigger.py のトリガー。給餌中だけ狙い点を出す (None = 常に給餌中)"""
         from collections import deque
         self.seg = FishModelSegmenter(model_dir) if model_dir else FishSchoolSegmenter()
         self.hist = deque(maxlen=n)
         self.hold, self.last_t, self.aim = hold, 0.0, None
+        self.trigger = trigger
 
     def __call__(self, bgr):
         import time
         r = self.seg(bgr)
+        r["feeding"], r["trigger_info"] = self.trigger(bgr) if self.trigger else (True, {})
+        if not r["feeding"]:  # 待機中は狙い点を出さない
+            r["aim"] = None
+            self.hist.clear()
         now = time.time()
         if r["aim"]:
             self.hist.append(r["aim"])
@@ -250,7 +256,11 @@ class LiveFish:
 
     def draw(self, bgr, r):
         out = FishSchoolSegmenter.draw(bgr, r)
-        info = {"fish_ratio": round(r["fish_ratio"], 4), "aim_x": None, "aim_y": None, "aim_dx": None, "aim_dy": None}
+        if self.trigger:
+            from trigger import draw_state
+            draw_state(out, r["feeding"], self.trigger.name, r["trigger_info"])
+        info = {"feeding": int(r["feeding"]), "fish_ratio": round(r["fish_ratio"], 4),
+                "aim_x": None, "aim_y": None, "aim_dx": None, "aim_dy": None}
         cs, _ = cv2.findContours(r["roi"], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if r["aim"] and cs and len(max(cs, key=cv2.contourArea)) >= 5:
             (ex, ey), (a, b), ang = cv2.fitEllipse(max(cs, key=cv2.contourArea))
@@ -303,6 +313,9 @@ def main():
     ap.add_argument("--fps", type=float, default=4.0, help="--video のフレームレート (アーカイブ 5 秒間隔なら 4 で 20 倍速)")
     ap.add_argument("--width", type=int, default=1280, help="--video の横幅")
     ap.add_argument("--smooth", type=int, default=1, help="狙い点を直近 N フレームの中央値にする (連続画像向け)")
+    ap.add_argument("--trigger", choices=["redcup", "switch"],
+                    help="給餌開始トリガー。指定すると給餌中だけ狙い点を出し、待機/給餌中を表示する (trigger.py)")
+    ap.add_argument("--switch-file", default="feeding_switch.txt", help="--trigger switch の信号ファイル")
     args = ap.parse_args()
     if not args.dst:  # 既存の結果 (feeding/fish など) を上書きしないよう、入力ごとに別フォルダ
         args.dst = os.path.join("fish_out", os.path.splitext(os.path.basename(os.path.normpath(args.src)))[0])
@@ -310,11 +323,27 @@ def main():
     if not args.video:
         os.makedirs(os.path.join(args.dst, "overlays"), exist_ok=True)
     seg = FishModelSegmenter(args.model) if args.model else FishSchoolSegmenter()
+    trig, clock = None, {"t": 0.0}
+    if args.trigger:
+        from trigger import draw_state, make_trigger
+        trig = make_trigger(args.trigger, switch_file=args.switch_file, clock=lambda: clock["t"]) \
+            if args.trigger == "redcup" else make_trigger(args.trigger, switch_file=args.switch_file)
     from collections import deque
     hist = deque(maxlen=max(1, args.smooth))
     writer, rows = None, []
     for i, (name, img) in enumerate(frames(args.src, args.start, args.end, args.step), 1):
         r = seg(img)
+        feeding, tinfo = True, {}
+        if trig:
+            # 時刻: アーカイブのファイル名 (HH-MM-SS) から。読めなければ 5 秒間隔とみなす
+            try:
+                h_, m_, s_ = (int(v) for v in name[-8:].split("-"))
+                clock["t"] = h_ * 3600 + m_ * 60 + s_
+            except ValueError:
+                clock["t"] = i * 5.0
+            feeding, tinfo = trig(img)
+            if not feeding:
+                r["aim"] = None
         if r["aim"]:
             hist.append(r["aim"])
         else:
@@ -322,6 +351,8 @@ def main():
         if args.smooth > 1 and hist:
             r["aim"] = tuple(float(v) for v in np.median(np.array(hist), axis=0))
         out = FishSchoolSegmenter.draw(img, r)
+        if trig:
+            draw_state(out, feeding, trig.name, tinfo)
         cv2.imwrite(os.path.join(args.dst, "masks", name + ".png"), r["fish"])
         if args.video:
             h = args.width * out.shape[0] // out.shape[1]
@@ -337,7 +368,7 @@ def main():
             cv2.imwrite(os.path.join(args.dst, "overlays", name + ".jpg"), out, [cv2.IMWRITE_JPEG_QUALITY, 88])
         cx, cy = r["centroid"] or (None, None)
         ax, ay = r["aim"] or (None, None)
-        rows.append({"name": name, "fish_ratio": round(r["fish_ratio"], 4), "foam_ratio": round(r["foam_ratio"], 4),
+        rows.append({"name": name, "feeding": int(feeding), "fish_ratio": round(r["fish_ratio"], 4), "foam_ratio": round(r["foam_ratio"], 4),
                      "cx": None if cx is None else round(cx, 1), "cy": None if cy is None else round(cy, 1),
                      "aim_x": None if ax is None else round(ax, 1), "aim_y": None if ay is None else round(ay, 1)})
         if i % 100 == 0:

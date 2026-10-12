@@ -16,3 +16,5 @@ dataset_fish/
 labels/
 fish_out/
 models/fish_segformer_v1/
+analysis/
+report/

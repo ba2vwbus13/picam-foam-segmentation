@@ -12,6 +12,7 @@ PiCam MJPEG ストリームに対するリアルタイム・セグメンテー�
   .venv/bin/python stream_segmentation.py --mode both --save out.mp4
   .venv/bin/python stream_segmentation.py --mode foam --csv foam_log.csv
   .venv/bin/python stream_segmentation.py --mode fish --fish-model models/fish_segformer --fish-csv fish_log.csv
+  .venv/bin/python stream_segmentation.py --mode fish --fish-model models/fish_segformer --trigger switch   # 実運用 (アーム電源 ON で給餌開始)
 
 ローカル画像で試す場合:
   .venv/bin/python stream_segmentation.py --image sample.jpg
@@ -248,6 +249,10 @@ def main():
     ap.add_argument("--csv", help="foam モードで泡の割合を時系列 CSV に追記")
     ap.add_argument("--fish-model", help="学習済み 4 クラスモデル (例: models/fish_segformer)。未指定時は閾値処理")
     ap.add_argument("--fish-csv", help="fish モードで魚群の割合・給餌の狙い点を時系列 CSV に追記")
+    ap.add_argument("--trigger", choices=["always", "redcup", "switch"], default="always",
+                    help="給餌開始トリガー (trigger.py)。redcup = 赤いコップを持った人が水槽に近づいたら (開発用)、"
+                         "switch = ロボットアームの電源 ON (信号ファイルで代用)。給餌中だけ狙い点を出力")
+    ap.add_argument("--switch-file", default="feeding_switch.txt", help="--trigger switch の信号ファイル (中身が ON で給餌中)")
     ap.add_argument("--save-fps", type=float, default=15.0,
                     help="保存動画の fps。実時間に合わせて間引き/複製するので再生速度は実時間と一致")
     ap.add_argument("--csv-interval", type=float, default=1.0, help="CSV 記録間隔 [秒]")
@@ -274,7 +279,11 @@ def main():
     fish = None
     if "fish" in modes:
         from fish import LiveFish
-        fish = LiveFish(args.fish_model)
+        trig = None
+        if args.trigger != "always":
+            from trigger import make_trigger
+            trig = make_trigger(args.trigger, switch_file=args.switch_file)
+        fish = LiveFish(args.fish_model, trigger=trig)
 
     if args.image:
         frame = cv2.imread(args.image)
@@ -320,8 +329,8 @@ def main():
                 fi = info["fish"]
                 with open(args.fish_csv, "a") as f:
                     if new:
-                        f.write("timestamp,fish_ratio,aim_x,aim_y,aim_dx,aim_dy\n")
-                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{fi['fish_ratio']},"
+                        f.write("timestamp,feeding,fish_ratio,aim_x,aim_y,aim_dx,aim_dy\n")
+                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{fi['feeding']},{fi['fish_ratio']},"
                             f"{fi['aim_x']},{fi['aim_y']},{fi['aim_dx']},{fi['aim_dy']}\n")
                 last_fish_log = time.time()
             if args.csv and "foam" in info and time.time() - last_log >= args.csv_interval:
